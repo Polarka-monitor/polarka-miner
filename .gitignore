@@ -1,0 +1,20 @@
+# build output and tool caches
+build/
+.gradle/
+.kotlin/
+local.properties
+
+# packages are published as releases, never committed
+*.apk
+*.aab
+
+# signing material never belongs in the repository
+*.jks
+*.keystore
+signing.properties
+
+# editors and the operating system
+.idea/
+*.iml
+.DS_Store
+.cxx/

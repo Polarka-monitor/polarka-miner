@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(rxflow CXX C ASM)
+set(CMAKE_CXX_STANDARD 17)
+add_subdirectory("${RANDOMX_DIR}" randomx EXCLUDE_FROM_ALL)
+add_executable(rxflow rxflow.cpp)
+target_include_directories(rxflow PRIVATE "${RANDOMX_DIR}/src")
+target_link_libraries(rxflow randomx)
