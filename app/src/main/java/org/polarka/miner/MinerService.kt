@@ -132,6 +132,8 @@ class MinerService : Service() {
                     MinerState.accepted++
                     wonOn = w.previous
                     MinerState.say(tr("BLOCK ${w.height} ACCEPTED by the node (nonce $nonce)", "BLOK ${w.height} PŘIJAT uzlem (nonce $nonce)"))
+                    refresh = true          // the tip moved: ask for the next block at once
+                    client.interrupt()
                 } else {
                     MinerState.refused++
                     MinerState.say(tr("the node refused block ${w.height}: $res", "blok ${w.height} uzel nepřijal: $res"))
@@ -227,13 +229,40 @@ class MinerService : Service() {
             }
             nap(5000)
         }
+        var polledPrevious = ""
+        var polledAt = 0L
         while (!stop) {
-            if (refresh) { refresh = false; lp = null }
+            if (refresh) { refresh = false; lp = null; polledPrevious = "" }
             try {
-                val w = newWork(client, client.template(lp), pay)
-                lp = w.longPollId
-                failingSince = 0L
-                lastMessage = ""
+                val asked = System.currentTimeMillis()
+                val t = client.template(lp)
+                val previous = t.optString("previousblockhash")
+                val now = System.currentTimeMillis()
+                // Without a long poll the same template comes back every few seconds. The work in hand is
+                // kept while the tip is the same, and renewed twice a minute for the new transactions and time.
+                val same = previous == polledPrevious && now - polledAt < 30_000 && synchronized(lock) { current != null }
+                if (same && (lp == null || client.rest)) {
+                    failingSince = 0L
+                    lastMessage = ""
+                    // A wallet server ends a long poll after 25 seconds also when nothing changed. The wait
+                    // goes on with the identifier it gave, and an answer that came at once is not asked for
+                    // again at once.
+                    if (lp != null) {
+                        lp = t.optString("longpollid").ifEmpty { null }
+                        if (now - asked < 2000) nap(2000)
+                    }
+                } else {
+                    val w = newWork(client, t, pay)
+                    lp = w.longPollId
+                    polledPrevious = previous
+                    polledAt = now
+                    failingSince = 0L
+                    lastMessage = ""
+                }
+                if (lp == null) {
+                    val end = System.currentTimeMillis() + 5000
+                    while (!stop && !refresh && System.currentTimeMillis() < end) Thread.sleep(100)
+                }
             } catch (e: java.net.SocketTimeoutException) {
                 // a long poll that ran out of time is normal: ask again; a plain question that did is not
                 if (lp == null) trouble(tr("the node does not answer in time", "uzel neodpovídá včas")) else lp = null

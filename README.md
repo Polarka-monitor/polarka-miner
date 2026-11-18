@@ -1,14 +1,14 @@
 # Polarka Miner
 
-An Android app that mines [TrueNorth](https://github.com/truenorth-project/truenorth) (NORTH) on a phone, solo, against a node you run yourself.
+An Android app that mines [TrueNorth](https://github.com/truenorth-project/truenorth) (NORTH) on a phone, solo: through a wallet server that hands out work, or against a node you run yourself.
 
-**Status: test build.** It has mined on regtest and against a node on mainnet on one phone. An independent AI reviewer read the code of 0.1.2; its High and Medium findings are fixed, some of the Low ones are still open, and nobody independent has looked at the fixes (see `review/`). No independent human or security expert has reviewed it. Use it on a phone you can afford to heat up.
+**Status: test build.** It has mined on regtest and against a node on mainnet on one phone. From 0.2.0 it can also mine without a node of yours, through a wallet server with the mining routes of Northbound. That way has run on mainnet against the public Northbound server, on an emulator and on one phone, for under half an hour in all; no block has been found through a server yet, so a found block being accepted that way has not been seen. An independent AI reviewer read the code of 0.1.2; its High and Medium findings are fixed, some of the Low ones are still open, and nobody independent has looked at the fixes or at the way through a server (see `review/`). No independent human or security expert has reviewed it. Use it on a phone you can afford to heat up.
 
 ## What it does, and what it does not
 
 - It asks your node for a block template, puts the block together on the phone, tries nonces with RandomX (the library from the TrueNorth sources, unchanged) and hands a found block back to your node.
 - It holds **no keys to coins**. It knows one address to mine to. The reward of a block it finds goes to that address, straight from the network.
-- It needs a node. There is no pool in it and no public server yet. If you do not run a node, this build is not for you yet.
+- It needs somebody who hands out work: a wallet server with the mining routes of Northbound, or your own node. There is no pool in it. Through a server the phone still puts the block together itself, so the server never holds a reward and cannot send it elsewhere. The server sees the phone's internet address and the address you mine to, and it could hand out no work or drop a block you found.
 - It is not on Google Play and will not be: Play does not allow mining on the device. The package is on the Releases page only.
 
 ## What to expect
@@ -21,13 +21,21 @@ One measurement, one phone (a 2026 flagship with 12 GB of memory), 16 November 2
 | 4 | about 1.0 kH/s | about 0.40 kH/s at 38.6 °C |
 | 8 | about 1.25 kH/s | about 0.64 kH/s at 40 to 42 °C, too warm to keep up |
 
+A second, shorter run on 18 November 2026, two threads through the public server: 423 H/s in the first minute, about 210 H/s after five minutes with the battery at 37.7 °C and the system reporting that it was getting warm. The network was at about 320 kH/s that day; 0.2 to 0.4 kH/s then finds a block in one to two days on average.
+
 Heat decides, not the number of cores. With the network at about 213 kH/s on that day, 0.4 kH/s finds a block about once a day on average. That falls as the network grows: at twenty times the hashrate it is a block in about two weeks. Older and cheaper phones will be much slower, and phones with less than about 6 GB of memory cannot use the fast mode at all.
 
 Nothing here is a promise of income. NORTH is not traded anywhere I know of and may never be worth anything.
 
 ## Setting it up
 
-### 1. The node
+### Without a node of your own
+
+Enter the address of a wallet server that hands out work and leave the user and the password empty. The public server of the Northbound project is `https://api.northboundwallet.org`; it is run by nova9, not by this project, and it is a pre-release. Then the address for the reward, and **Start mining**. Nothing else is needed.
+
+The app asks the server for a block template and waits there for the next one, asks once for the hash of the block that the RandomX key comes from, and hands a found block back. It sends no name and no password.
+
+### With your own node: 1. The node
 
 Give the miner a user of its own that may do three things and nothing else. In `truenorth.conf`:
 
@@ -45,7 +53,7 @@ rpcallowip=<the phone's address in your private network>
 - The node's RPC speaks plain http. **Name and password travel unencrypted**, so the phone and the node should meet inside a private network: a VPN such as Tailscale or WireGuard, or your home network. Do not open the RPC port to the internet.
 - Restart the node. The mainnet RPC port is 9554.
 
-### 2. The app
+### With your own node: 2. The app
 
 Install the package from the Releases page (check it first, see below), then enter:
 
@@ -78,7 +86,7 @@ You need the Android SDK with NDK 27.3.13750724 and CMake 3.22.1, and the TrueNo
 gradle :app:assembleRelease -PrandomxDir=/path/to/truenorth/src/randomx
 ```
 
-Without a signing file the release build is unsigned. `tools/check-so.sh` checks the native library for a fault that breaks RandomX's arm64 code in a shared library (see the note in `app/src/main/cpp/CMakeLists.txt`). `tools/gbt_reference.py` is a second, independent way from a template to a block for regtest, used to check the app's own.
+Without a signing file the release build is unsigned. `tools/check-so.sh` checks the native library for a fault that breaks RandomX's arm64 code in a shared library (see the note in `app/src/main/cpp/CMakeLists.txt`). `tools/gbt_reference.py` is a second, independent way from a template to a block for regtest, used to check the app's own. `tools/northbound_mining_standin.py` is a stand-in for the mining routes of a Northbound server in front of a regtest node, written from that server's documentation, for trying the way through a server without the server.
 
 ## Who made this
 
