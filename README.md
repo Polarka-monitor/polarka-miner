@@ -2,7 +2,7 @@
 
 An Android app that mines [TrueNorth](https://github.com/truenorth-project/truenorth) (NORTH) on a phone: in a pool over stratum, or solo through a wallet server that hands out work, or against a node you run yourself.
 
-**Status: test build.** It has mined on regtest and against a node on mainnet on one phone. From 0.2.0 it can also mine without a node of yours, through a wallet server with the mining routes of Northbound. That way has run on mainnet against the public Northbound server, on an emulator and on one phone, for under half an hour in all; no block has been found through a server yet, so a found block being accepted that way has not been seen. An independent AI reviewer read the code of 0.1.2; its High and Medium findings are fixed, some of the Low ones are still open, and nobody independent has looked at the fixes or at the way through a server (see `review/`). From 0.3.0 it can also mine in a pool over stratum, the protocol of IronMiner. That way has been tried only on a computer, against the pool's own code with a made-up proof of work (`tools/stratum_check.py`), and not yet on a phone. An independent AI reviewer read the pool code of 0.3.0 before it was released; what it found is mended in the same version (its report and what was done about each point are in `review/`), and nobody independent has looked at the fixes. No independent human or security expert has reviewed the app. Use it on a phone you can afford to heat up.
+**Status: test build.** It has mined on regtest and against a node on mainnet on one phone. From 0.2.0 it can also mine without a node of yours, through a wallet server with the mining routes of Northbound. That way has run on mainnet against the public Northbound server, on an emulator and on one phone, for under half an hour in all; no block has been found through a server yet, so a found block being accepted that way has not been seen. An independent AI reviewer read the code of 0.1.2; its High and Medium findings are fixed, some of the Low ones are still open, and nobody independent has looked at the fixes or at the way through a server (see `review/`). From 0.3.0 it can also mine in a pool over stratum, the protocol of IronMiner. That way has been tried only on a computer, against the pool's own code with a made-up proof of work (`tools/stratum_check.py`); 0.3.0 has run on one phone, but mining in a pool from a phone has not been seen yet. An independent AI reviewer read the pool code of 0.3.0 before it was released; what it found is mended in the same version (its report and what was done about each point are in `review/`), and nobody independent has looked at the fixes. No independent human or security expert has reviewed the app. Use it on a phone you can afford to heat up.
 
 ## What it does, and what it does not
 
@@ -10,7 +10,7 @@ An Android app that mines [TrueNorth](https://github.com/truenorth-project/truen
 - It holds **no keys to coins**. It knows one address to mine to. The reward of a block it finds goes to that address, straight from the network.
 - It needs somebody who hands out work: a pool, a wallet server with the mining routes of Northbound, or your own node. Through a wallet server the phone still puts the block together itself, so the server never holds a reward and cannot send it elsewhere. The server sees the phone's internet address and the address you mine to, and it could hand out no work or drop a block you found.
 - In a pool it is the other way round: the pool hands out jobs and puts the blocks together, the phone sends shares (hashes that would have been a block on a much easier chain), and the pool pays for them by its own rules. A block found that way pays the pool, which then pays the miners, so a pool could also not pay. It sees the phone's internet address and the address you mine to. **stratum+tcp is not encrypted.** On a network you do not trust (a café, a hotel, a network of strangers), whoever sits on the way can read what the phone and the pool say, and change it: put their own address where yours is, so that the pool pays them for your work while the phone shows shares accepted, or send the phone lines meant to trouble it. Mine in a pool on a network you trust, such as your home network or a VPN.
-- It is not on Google Play and will not be: Play does not allow mining on the device. The package is on the Releases page only.
+- It is not on Google Play and will not be: Play does not allow mining on the device. The signed package is on https://polarka.org/download/ only.
 
 ## What to expect
 
@@ -66,7 +66,7 @@ rpcallowip=<the phone's address in your private network>
 
 ### With your own node: 2. The app
 
-Install the package from the Releases page (check it first, see below), then enter:
+Install the package from https://polarka.org/download/ (check it first, see below), then enter:
 
 - **Node address**: `http://<node address>:9554`
 - **RPC user and password**: the ones from step 1
@@ -85,7 +85,7 @@ Mining keeps the processor busy for hours. The phone gets warm and its battery a
 
 ## Checking the package
 
-- SHA-256 of the file is on the Releases page next to it.
+- SHA-256 of the file is on the download page and in its `SHA256SUMS`.
 - The package is signed with this certificate (SHA-256): `90:24:C9:7D:6F:78:6E:82:B0:CE:F3:A4:B2:C9:DD:8E:06:2D:18:72:47:EC:B8:A5:27:50:FC:C1:DA:3B:73:AC`. Check with `apksigner verify --print-certs`.
 - The app asks for these permissions and no others: network, foreground service, notifications, wake lock.
 
