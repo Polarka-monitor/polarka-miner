@@ -27,20 +27,27 @@ object Hex {
     fun reversed(s: String): ByteArray = decode(s).reversedArray()
 }
 
+/** What the native workers hash: the header without its nonce, and the target a nonce must meet. */
+interface Mineable {
+    val header76: ByteArray
+    /** A 256-bit number, least significant byte first, as the native side compares it. */
+    val target: ByteArray
+}
+
 /**
  * One piece of work made from a block template: everything of the block except the nonce.
  * [target] is a 256-bit number, least significant byte first, as the native side compares it.
  */
 class Work(
     val height: Int,
-    val header76: ByteArray,
+    override val header76: ByteArray,
     val rest: ByteArray,
-    val target: ByteArray,
+    override val target: ByteArray,
     val seedHeight: Int,
     val previous: String,
     val longPollId: String?,
     val transactions: Int,
-) {
+) : Mineable {
     fun header(nonce: Long): ByteArray = header76 + Blocks.le(nonce, 4)
     fun block(nonce: Long): ByteArray = header(nonce) + rest
 }

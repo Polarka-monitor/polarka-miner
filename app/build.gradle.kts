@@ -19,8 +19,8 @@ android {
         applicationId = "org.polarka.miner"
         minSdk = 31
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.2.0"
+        versionCode = 10
+        versionName = "0.3.0"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { arguments += listOf("-DRANDOMX_DIR=$randomxDir", "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", "-DANDROID_STL=c++_static") }

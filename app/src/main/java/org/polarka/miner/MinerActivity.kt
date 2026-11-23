@@ -19,8 +19,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 
 /**
- * The screen of the miner: where the node is, which address gets the reward, how many threads, how warm the
- * battery may get. Start and stop. What is typed here stays in the app's private storage on this phone.
+ * The screen of the miner: where the work comes from (a pool, a node or a wallet server), which address gets
+ * paid, how many threads, how warm the battery may get. Start and stop. What is typed here stays in the app's
+ * private storage on this phone.
  * The app holds no keys to coins: it knows only the address it mines to.
  */
 class MinerActivity : Activity() {
@@ -57,12 +58,14 @@ class MinerActivity : Activity() {
         val plain = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
         column.addView(TextView(this).apply {
             textSize = 15f
-            text = tr("Polarka Miner (test build ${version()}). It mines NORTH against your node, to the address you enter. ", "Polarka Miner (zkušební verze ${version()}). Těží NORTH proti tvému uzlu na adresu, kterou zadáš. ") +
+            text = tr("Polarka Miner (test build ${version()}). It mines NORTH in a pool, or alone against your node or a wallet server, to the address you enter. ", "Polarka Miner (zkušební verze ${version()}). Těží NORTH v poolu, nebo sám proti tvému uzlu či serveru peněženek, na adresu, kterou zadáš. ") +
                 tr("There are no keys to coins in this app. Mining heats the phone and shortens the life of its battery.", "Žádné klíče k mincím tu nejsou. Těžba telefon zahřívá a baterii zkracuje život.")
         })
-        column.addView(label(tr("Address of your node (RPC), for example http://100.x.y.z:9554, or of a wallet server that hands out work (Northbound), for example https://api.northboundwallet.org. Over http the name and the password travel unencrypted: use http only inside a private network (Tailscale, home network).", "Adresa tvého uzlu (RPC), například http://100.x.y.z:9554, nebo serveru peněženek, který rozdává práci (Northbound), například https://api.northboundwallet.org. Přes http jdou jméno a heslo nešifrovaně: http používej jen uvnitř soukromé sítě (Tailscale, domácí síť).")))
-        url = field("http://…", p.getString("url", "") ?: "", plain or InputType.TYPE_TEXT_VARIATION_URI); column.addView(url)
-        column.addView(label(tr("RPC user and password for your own node (a user limited to getblocktemplate, getblockhash, submitblock). Leave both empty for a wallet server: it asks for no name.", "Uživatel RPC a heslo pro vlastní uzel (uživatel omezený na getblocktemplate, getblockhash, submitblock). U serveru peněženek nech obě pole prázdná: jméno nechce.")))
+        column.addView(label(tr("Where the work comes from. A pool: stratum+tcp://host:port, for example stratum+tcp://pool.polarka.org:3333; any pool that speaks stratum the way IronMiner does will do, and the pool pays for shares by its own rules. Alone: your node's RPC, for example http://100.x.y.z:9554, or a wallet server that hands out work (Northbound), for example https://api.northboundwallet.org; a block found alone pays its whole reward, but on a phone that can take weeks. Over http the name and the password travel unencrypted: use http only inside a private network (Tailscale, home network).",
+            "Odkud je práce. Pool: stratum+tcp://host:port, například stratum+tcp://pool.polarka.org:3333; poslouží každý pool, který mluví stratum jako IronMiner, a za podíly platí podle svých pravidel. Sám: RPC tvého uzlu, například http://100.x.y.z:9554, nebo server peněženek, který rozdává práci (Northbound), například https://api.northboundwallet.org; blok nalezený sám vyplatí celou odměnu, ale na telefonu to může trvat týdny. Přes http jdou jméno a heslo nešifrovaně: http používej jen uvnitř soukromé sítě (Tailscale, domácí síť).")))
+        url = field("stratum+tcp://… / http://…", p.getString("url", "") ?: "", plain or InputType.TYPE_TEXT_VARIATION_URI); column.addView(url)
+        column.addView(label(tr("In a pool: a worker name if you like (it is put after the address) and the pool's password, empty for x. For your own node: the RPC user and password (a user limited to getblocktemplate, getblockhash, submitblock). For a wallet server leave both empty: it asks for no name.",
+            "V poolu: jméno pracovníka, chceš-li (přidá se za adresu), a heslo poolu, prázdné znamená x. Pro vlastní uzel: uživatel RPC a heslo (uživatel omezený na getblocktemplate, getblockhash, submitblock). U serveru peněženek nech obě pole prázdná: jméno nechce.")))
         user = field(tr("user", "uživatel"), p.getString("user", "") ?: "", plain); column.addView(user)
         password = field(tr("password", "heslo"), p.getString("password", "") ?: "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD); column.addView(password)
         column.addView(label(tr("Address for the reward (north1z…)", "Adresa pro odměnu (north1z…)")))
@@ -106,7 +109,8 @@ class MinerActivity : Activity() {
 
     private fun show() {
         button.text = if (MinerState.running) tr("Stop mining", "Zastavit těžbu") else tr("Start mining", "Začít těžit")
-        status.text = MinerState.line + tr("\nblocks accepted: ${MinerState.accepted}, refused: ${MinerState.refused}", "\npřijaté bloky: ${MinerState.accepted}, nepřijaté: ${MinerState.refused}")
+        status.text = MinerState.line + if (MinerState.pool) tr("\nshares accepted: ${MinerState.accepted}, refused: ${MinerState.refused}", "\npřijaté podíly: ${MinerState.accepted}, nepřijaté: ${MinerState.refused}")
+            else tr("\nblocks accepted: ${MinerState.accepted}, refused: ${MinerState.refused}", "\npřijaté bloky: ${MinerState.accepted}, nepřijaté: ${MinerState.refused}")
         val text = MinerState.log()
         val tail = if (text.length > 6000) text.substring(text.length - 6000) else text
         if (log.text.toString() != tail) log.text = tail

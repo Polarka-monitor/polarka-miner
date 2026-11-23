@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The node's RPC, nothing else. -->
+    <!-- A pool (stratum over TCP), a node's RPC or a wallet server, nothing else. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Mining goes on while the app is not on the screen: a service with a permanent notification. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
