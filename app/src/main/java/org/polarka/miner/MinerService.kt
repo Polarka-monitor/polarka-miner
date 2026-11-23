@@ -87,7 +87,7 @@ class MinerService : Service() {
     private var jobId = 0L
     private var current: Mineable? = null
     private var keyHeight = -1
-    private var preparedKey: ByteArray? = null
+    @Volatile private var preparedKey: ByteArray? = null
     private var submitted = 0L
     @Volatile private var paused: String? = null
     private var cpus = IntArray(0)
@@ -98,16 +98,19 @@ class MinerService : Service() {
     // In a pool. Everything below is guarded by `lock`, unless it is volatile.
     @Volatile private var stratum: StratumClient? = null
     private var connection = 0L                      // the connection the pool's work belongs to
-    private var poolKey: ByteArray? = null           // the RandomX key the pool named last
-    private var poolKeyHeight = -1
-    private var poolDifficulty = 0.0
+    private val keys = PoolKeys()                    // the RandomX keys the pool may make the phone build memory for
     private var poolLatest: PoolWork? = null         // the newest work, not yet given to the workers
+    private var cleanPending = false                 // a job that throws away the older ones came after the last one given
     private var extranonce2 = 0L
     private val poolJobs = LinkedHashMap<Long, PoolWork>()
-    private val keyChanges = ArrayDeque<Long>()
+    private val sentShares = LinkedHashSet<Long>()   // (job number, nonce) of shares sent, folded into one number
     private val poolWake = java.util.concurrent.ArrayBlockingQueue<Unit>(1)   // one waiting wake-up is enough
     @Volatile private var lastRefusal: String? = null
     @Volatile private var lastRefusalAt = 0L
+    @Volatile private var unsent = 0                 // shares that could not be sent: not let in yet, too many open, a broken connection
+    @Volatile private var unsentSaidAt = 0L
+    @Volatile private var building = -2              // the height of the key whose memory is being built; -2: none
+    @Volatile private var prepFailures = 0           // preparations that failed one after another
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -127,20 +130,22 @@ class MinerService : Service() {
     override fun onDestroy() {
         stop = true
         node?.interrupt()
-        stratum?.close()
         wakePool()
         MinerState.line = tr("stopping", "zastavuji")
         val control = thread
         val asking = templates
         val reading = reader
         val held = wake
-        // Nothing here waits on the main thread. In this order, on a thread of its own: the loops end
-        // (a dataset that is being built is finished first), what was found is sent, the workers
-        // stop, the memory is given back. A run started right after waits for all of it.
+        // Nothing here waits on the main thread. In this order, on a thread of its own: the control loop ends,
+        // what was found is sent (to the pool on the connection that is still open), the connection to the pool
+        // is closed, the other loops end (a dataset that is being built is finished first), the workers stop,
+        // the memory is given back. A run started right after waits for all of it.
         cleanup = Thread({
-            try { control?.join(); asking?.join(); reading?.join() } catch (e: InterruptedException) { }
+            try { control?.join() } catch (e: InterruptedException) { }
             submitter.shutdown()
             try { submitter.awaitTermination(45, java.util.concurrent.TimeUnit.SECONDS) } catch (e: InterruptedException) { }
+            stratum?.close()
+            try { asking?.join(); reading?.join() } catch (e: InterruptedException) { }
             Native.stop()
             Native.release()
             held?.let { if (it.isHeld) it.release() }
@@ -241,16 +246,22 @@ class MinerService : Service() {
             val care = tr("threads $threads, battery limit $limit °C, ", "počet vláken $threads, strop teploty baterie $limit °C, ") +
                 if (onlyCharging) tr("only while charging", "jen při nabíjení") else tr("also when not charging", "i bez nabíječky")
             MinerState.pool = inPool
+            // every run counts from zero: blocks alone, shares in a pool (review of 0.3.0, L5)
             MinerState.difficulty = 0.0
+            MinerState.accepted = 0
+            MinerState.refused = 0
+            MinerState.height = 0
             if (inPool) {
                 val where = StratumUrl.parse(url)
-                val worker = (p.getString("user", "") ?: "").trim()
+                // A pool has a name and a password of its own, stored apart from those of a node: an RPC password
+                // never travels to a pool, over a connection that is not encrypted (review of 0.3.0, M2).
+                val worker = (p.getString("poolUser", "") ?: "").trim()
                 require(worker.length <= 32 && worker.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' || it == '_' }) {
                     tr("a worker name has at most 32 letters, digits, - and _", "jméno pracovníka má nejvýš 32 písmen bez diakritiky, číslic, - a _")
                 }
                 val lower = address.lowercase(Locale.ROOT)
                 val user = if (worker.isEmpty()) lower else "$lower.$worker"
-                val password = (p.getString("password", "") ?: "").ifEmpty { "x" }
+                val password = (p.getString("poolPassword", "") ?: "").ifEmpty { "x" }
                 MinerState.say(tr("starting in the pool $where: address $shown (${Blocks.PREFIXES[hrp]}), ", "začínám v poolu $where: adresa $shown (${Blocks.PREFIXES[hrp]}), ") +
                     (if (worker.isEmpty()) "" else tr("worker $worker, ", "pracovník $worker, ")) + care)
                 templates = Thread({ poolWorkLoop() }, "miner-pool-work").apply { start() }
@@ -346,9 +357,29 @@ class MinerService : Service() {
 
     /**
      * Builds the cache and the dataset for a RandomX key and starts the workers on it. Before the first key the
-     * phone proves that it computes RandomX as the network does. Takes minutes; nothing is hashed meanwhile.
+     * phone proves that it computes RandomX as the network does. Takes minutes; nothing is hashed meanwhile. The
+     * memory is built with the threads the owner chose, not with every core (review of 0.3.0, M1). Three
+     * preparations that fail one after another end the run: one more would fail the same way (N9).
      */
     private fun prepareKey(key: ByteArray, height: Int) {
+        building = height
+        try {
+            build(key, height)
+            prepFailures = 0
+        } catch (e: Exception) {
+            if (!stop && ++prepFailures >= 3) {
+                val why = e.message ?: e.javaClass.simpleName
+                MinerState.say(tr("the memory for mining could not be prepared three times in a row; mining ends: $why", "paměť pro těžbu se nepodařilo připravit třikrát po sobě; těžba končí: $why"))
+                MinerState.line = tr("cannot mine: ", "nelze těžit: ") + why
+                stopSelf()
+            }
+            throw e
+        } finally {
+            building = -2
+        }
+    }
+
+    private fun build(key: ByteArray, height: Int) {
         synchronized(lock) { current = null; Native.setJob(null, null, 0) }
         if (!checked) {
             // before anything is mined the phone proves that it computes RandomX as the network does
@@ -363,7 +394,7 @@ class MinerService : Service() {
         // system, so the fast mode is tried only where the whole memory is about 6 GB or more.
         val mem = android.app.ActivityManager.MemoryInfo()
         (getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager).getMemoryInfo(mem)
-        var ans = if (mem.totalMem >= 5_500L * 1024 * 1024) Native.prepare(key, true, Runtime.getRuntime().availableProcessors())
+        var ans = if (mem.totalMem >= 5_500L * 1024 * 1024) Native.prepare(key, true, maxOf(1, cpus.size))
             else "error: " + tr("this phone has too little memory for the fast mode", "tento telefon má na rychlý režim málo paměti")
         if (!ans.startsWith("ok")) {
             MinerState.say(ans)
@@ -383,6 +414,8 @@ class MinerService : Service() {
     private fun newWork(client: NodeClient, t: org.json.JSONObject, pay: ByteArray): Work {
         val w = Blocks.assemble(t, pay, synchronized(lock) { extranonce++ })
         if (w.seedHeight != keyHeight) {
+            // the old work is stale from here on: the workers stop before the node is asked for the new key
+            synchronized(lock) { current = null; Native.setJob(null, null, 0) }
             val key = if (w.seedHeight == 0) ByteArray(32) else Hex.reversed(client.blockHash(w.seedHeight))
             prepareKey(key, w.seedHeight)
             keyHeight = w.seedHeight
@@ -413,42 +446,65 @@ class MinerService : Service() {
     /**
      * What one connection says. The client calls these on its reading thread; they only take note and wake the
      * thread that gives work to the workers, so that the connection is read also while memory is being built.
+     * The difficulty and the key are this connection's own: a job is mined only with what its own connection
+     * named, never with what an earlier one did (review of 0.3.0, L3).
      */
     private inner class PoolEvents(private val conn: Long) : StratumEvents {
         lateinit var client: StratumClient
+        private var difficulty = 0.0
+        private var key: ByteArray? = null
+        private var keyHeight = -1
+        private var saidAt = 0L
+        private var said = ""
+        private var mismatchSaidAt = 0L
 
         override fun difficulty(d: Double) {
-            synchronized(lock) { if (conn == connection) poolDifficulty = d }
+            synchronized(lock) { if (conn == connection) difficulty = d }
         }
 
         override fun seed(key: ByteArray, height: Int) {
-            synchronized(lock) {
-                if (conn != connection || poolKey?.contentEquals(key) == true) return
-                val now = System.currentTimeMillis()
-                // the key of the network changes every 2048 blocks, about every three days
-                if (poolKey != null) keyChanges.addLast(now)
-                while (keyChanges.isNotEmpty() && now - keyChanges.first() > 30 * 60_000L) keyChanges.removeFirst()
-                if (keyChanges.size > 3) throw PoolMisbehaves(tr("the pool changes the RandomX key too often; it costs the phone minutes each time", "pool příliš často mění klíč RandomX; telefon to pokaždé stojí minuty"))
-                poolKey = key.copyOf()
-                poolKeyHeight = height
+            val fresh = synchronized(lock) {
+                if (conn != connection) return
+                val fresh = keys.named(key, height)      // throws PoolMisbehaves for a key that cannot be the network's
+                this.key = key.copyOf()
+                keyHeight = height
+                fresh
             }
+            if (fresh && preparedKey != null) MinerState.say(tr("the pool names a new RandomX key, from block $height", "pool uvádí nový klíč RandomX, z bloku $height"))
         }
 
         override fun job(job: StratumJob) {
             synchronized(lock) {
                 if (conn != connection) return
-                val key = poolKey ?: return              // no key yet: the work could not be hashed
-                if (poolDifficulty <= 0.0) return        // no difficulty yet: no share target
+                val key = key ?: return                  // no key on this connection yet: the work could not be hashed
+                if (difficulty <= 0.0) return            // no difficulty on this connection yet: no share target
+                if (!keys.fits(job.height, keyHeight)) {
+                    // the key named does not belong to the job's block: what it found would be wrong
+                    val now = System.currentTimeMillis()
+                    if (now - mismatchSaidAt > 60_000) {
+                        mismatchSaidAt = now
+                        MinerState.say(tr("the pool sent work for block ${job.height} with the RandomX key of block $keyHeight; that work is left aside",
+                            "pool poslal práci pro blok ${job.height} s klíčem RandomX bloku $keyHeight; tuto práci vynechávám"))
+                    }
+                    return
+                }
                 extranonce2++
                 val e2 = Blocks.le(extranonce2, client.extranonce2Size).reversedArray()
-                poolLatest = PoolWork(job, e2, StratumMath.header76(job, client.extranonce1, e2), StratumMath.target(poolDifficulty),
-                    key, poolKeyHeight, poolDifficulty, conn)
+                if (job.clean) cleanPending = true
+                poolLatest = PoolWork(job, e2, StratumMath.header76(job, client.extranonce1, e2), StratumMath.target(difficulty),
+                    key, keyHeight, difficulty, conn)
             }
             wakePool()
         }
 
         override fun message(text: String) {
-            if (text.isNotEmpty()) MinerState.say(tr("the pool says: ", "pool říká: ") + text)
+            // at most one message every five seconds, and the same one not again within a minute (review of 0.3.0, L4)
+            if (text.isEmpty()) return
+            val now = System.currentTimeMillis()
+            if (now - saidAt < 5_000 || (text == said && now - saidAt < 60_000)) return
+            saidAt = now
+            said = text
+            MinerState.say(tr("the pool says: ", "pool říká: ") + text)
         }
 
         override fun share(accepted: Boolean, why: String?) {
@@ -486,20 +542,24 @@ class MinerService : Service() {
                 c.run()                                  // returns only by an exception
                 why = "?"
             } catch (e: PoolMisbehaves) {
+                // a key that cannot be the network's: the phone keeps the memory it has and asks again in an hour
                 why = e.message ?: "?"
-                after = 10 * 60_000L
+                after = 60 * 60_000L
             } catch (e: StratumError) {
                 why = e.message ?: "?"
-                if (!c.authorized) after = maxOf(wait, 60_000L)   // refused before mining: no hurry to ask again
+                if (!c.wasAuthorized) after = maxOf(wait, 60_000L)   // refused before mining: no hurry to ask again
             } catch (e: IOException) {
                 why = e.message ?: e.javaClass.simpleName
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // whatever else ends this connection, it does not end the app (review of 0.3.0, H1)
                 why = e.message ?: e.javaClass.simpleName
             }
+            c.close()
             stratum = null
             synchronized(lock) {
                 connection++
                 poolLatest = null
+                cleanPending = false
                 poolJobs.clear()
                 if (current is PoolWork) { current = null; Native.setJob(null, null, 0) }
             }
@@ -513,61 +573,110 @@ class MinerService : Service() {
         }
     }
 
-    /** Gives the newest work of the pool to the workers, building the memory for a new key first. */
+    /**
+     * Gives the newest work of the pool to the workers, building the memory for a new key first. No memory is
+     * built while mining is paused (heat, no charger): the newest work waits, and the build follows the pause
+     * (review of 0.3.0, M1).
+     */
     private fun poolWorkLoop() {
         while (!stop) {
-            poolWake.poll(1, java.util.concurrent.TimeUnit.SECONDS)
-            if (stop) break
-            val w = synchronized(lock) { poolLatest } ?: continue
-            if (!w.key.contentEquals(preparedKey)) {
-                try {
-                    prepareKey(w.key, w.keyHeight)      // minutes; the connection is read meanwhile on its own thread
-                } catch (e: Exception) {
-                    if (stop) break
-                    MinerState.say(e.message ?: e.javaClass.simpleName)
-                    MinerState.line = tr("cannot mine: ", "nelze těžit: ") + (e.message ?: "?")
-                    stratum?.close()
-                    nap(30_000)
+            try {
+                poolWake.poll(1, java.util.concurrent.TimeUnit.SECONDS)
+                if (stop) break
+                val w = synchronized(lock) { poolLatest } ?: continue
+                if (!w.key.contentEquals(preparedKey)) {
+                    if (paused != null) continue
+                    try {
+                        prepareKey(w.key, w.keyHeight)      // minutes; the connection is read meanwhile on its own thread
+                    } catch (e: Exception) {
+                        if (stop) break
+                        MinerState.say(e.message ?: e.javaClass.simpleName)
+                        MinerState.line = tr("cannot mine: ", "nelze těžit: ") + (e.message ?: "?")
+                        nap(30_000)
+                    }
+                    wakePool()                              // newer work may have come meanwhile
+                    continue
                 }
-                wakePool()                              // newer work may have come meanwhile
-                continue
-            }
-            var given = false
-            synchronized(lock) {
-                if (w === poolLatest && w.connection == connection) {
-                    poolLatest = null
-                    jobId++
-                    if (w.job.clean) poolJobs.clear()
-                    poolJobs[jobId] = w
-                    while (poolJobs.size > 8) poolJobs.remove(poolJobs.keys.first())
-                    current = w
-                    currentId = jobId
-                    if (paused == null) Native.setJob(w.header76, w.target, jobId)
-                    given = true
+                var given = false
+                synchronized(lock) {
+                    if (w === poolLatest && w.connection == connection) {
+                        poolLatest = null
+                        jobId++
+                        // a clean job throws away the older ones, also when a newer job took its place before it was given
+                        if (w.job.clean || cleanPending) poolJobs.clear()
+                        cleanPending = false
+                        poolJobs[jobId] = w
+                        while (poolJobs.size > 8) poolJobs.remove(poolJobs.keys.first())
+                        current = w
+                        currentId = jobId
+                        if (paused == null) Native.setJob(w.header76, w.target, jobId)
+                        given = true
+                    }
                 }
+                if (!given) continue
+                val now = System.currentTimeMillis()
+                val height = w.job.height
+                if ((height != MinerState.height || w.difficulty != MinerState.difficulty) && now - lastWorkSaid > 2000) {
+                    MinerState.say(tr("new work from the pool: ", "nová práce od poolu: ") + (if (height >= 0) tr("block $height, ", "blok $height, ") else "") +
+                        tr("difficulty ", "obtížnost ") + shownDifficulty(w.difficulty))
+                    lastWorkSaid = now
+                }
+                if (height >= 0) MinerState.height = height
+                MinerState.difficulty = w.difficulty
+            } catch (e: Throwable) {
+                // nothing that goes wrong here ends the app (review of 0.3.0, H1)
+                if (stop) break
+                MinerState.say(tr("the work from the pool could not be used: ", "práci od poolu nelze použít: ") + (e.message ?: e.javaClass.simpleName))
+                nap(5_000)
             }
-            if (!given) continue
-            val now = System.currentTimeMillis()
-            val height = w.job.height
-            if ((height != MinerState.height || w.difficulty != MinerState.difficulty) && now - lastWorkSaid > 2000) {
-                MinerState.say(tr("new work from the pool: ", "nová práce od poolu: ") + (if (height >= 0) tr("block $height, ", "blok $height, ") else "") +
-                    tr("difficulty ", "obtížnost ") + shownDifficulty(w.difficulty))
-                lastWorkSaid = now
-            }
-            if (height >= 0) MinerState.height = height
-            MinerState.difficulty = w.difficulty
         }
     }
 
-    /** Shares the workers found: each one to the pool, on the connection whose job it is. */
+    /**
+     * The job in hand again after a pause, as new work: a new extranonce2 and a new number, so that the workers do
+     * not search again what they searched before the pause and send the same shares twice (review of 0.3.0, L1).
+     * Called with `lock` held.
+     */
+    private fun renewLocked(w: PoolWork) {
+        val c = stratum
+        if (c == null || w.connection != connection) { current = null; Native.setJob(null, null, 0); return }
+        extranonce2++
+        val e2 = Blocks.le(extranonce2, c.extranonce2Size).reversedArray()
+        val fresh = PoolWork(w.job, e2, StratumMath.header76(w.job, c.extranonce1, e2), w.target, w.key, w.keyHeight, w.difficulty, w.connection)
+        jobId++
+        poolJobs[jobId] = fresh
+        while (poolJobs.size > 8) poolJobs.remove(poolJobs.keys.first())
+        current = fresh
+        currentId = jobId
+        Native.setJob(fresh.header76, fresh.target, jobId)
+    }
+
+    /** Shares the workers found: each one to the pool, once, on the connection whose job it is. */
     private fun shares(found: LongArray) {
         val c = stratum
         for (i in found.indices step 2) {
             val id = found[i]
             val nonce = found[i + 1]
-            val w = synchronized(lock) { poolJobs[id]?.takeIf { it.connection == connection } } ?: continue
-            if (c == null) continue
-            submitter.execute { c.submit(w.job, w.extranonce2, nonce) }
+            val w = synchronized(lock) {
+                val w = poolJobs[id]?.takeIf { it.connection == connection } ?: return@synchronized null
+                // the same nonce of the same job is sent once (review of 0.3.0, L1)
+                if (!sentShares.add(id * 4_294_967_296L + (nonce and 0xffffffffL))) return@synchronized null
+                while (sentShares.size > 4096) sentShares.remove(sentShares.first())
+                w
+            } ?: continue
+            if (c == null) { notSent(); continue }
+            submitter.execute { if (!c.submit(w.job, w.extranonce2, nonce)) notSent() }
+        }
+    }
+
+    /** A share that could not be sent is counted, and said at most once a minute (review of 0.3.0, L2). */
+    private fun notSent() {
+        unsent++
+        val now = System.currentTimeMillis()
+        if (now - unsentSaidAt > 60_000) {
+            unsentSaidAt = now
+            MinerState.say(tr("a share could not be sent (the pool has not let the address in yet, too many shares wait for an answer, or the connection broke); not sent so far: $unsent",
+                "podíl se nepodařilo odeslat (pool adresu ještě nepustil, na odpověď čeká příliš mnoho podílů, nebo spojení spadlo); neodeslaných zatím: $unsent"))
         }
     }
 
@@ -609,6 +718,8 @@ class MinerService : Service() {
         var minuteLost = false
         var minuteAccepted = 0
         var minuteRefused = 0
+        var minuteUnsent = 0
+        var judged = 0.0                                    // the difficulty whose time per share was looked at
         val inPool = client == null
         while (!stop) {
             Thread.sleep(250)
@@ -638,8 +749,9 @@ class MinerService : Service() {
                     synchronized(lock) {
                         paused = reason
                         if (reason != null) Native.setJob(null, null, 0)
-                        else current?.let { Native.setJob(it.header76, it.target, currentId) }
+                        else current?.let { if (it is PoolWork) renewLocked(it) else Native.setJob(it.header76, it.target, currentId) }
                     }
+                    if (reason == null) wakePool()          // memory for a key that came during the pause is built now
                     MinerState.say(if (reason != null) tr("paused: $reason", "pauza: $reason") else tr("going on (battery %.1f °C)", "pokračuji (baterie %.1f °C)").format(Locale.ROOT, t))
                 } else if (reason != null) paused = reason
             }
@@ -656,11 +768,21 @@ class MinerService : Service() {
                 if (h < minuteHashes) { minuteHashes = h; minuteTime = nanos; minuteLost = true }
                 if (nanos - minuteTime >= 60_000_000_000L) {
                     val shares = if (!inPool) "" else tr(", shares +%d accepted, +%d refused", ", podíly +%d přijaté, +%d nepřijaté").format(Locale.ROOT,
-                        MinerState.accepted - minuteAccepted, MinerState.refused - minuteRefused)
+                        MinerState.accepted - minuteAccepted, MinerState.refused - minuteRefused) +
+                        (if (unsent > minuteUnsent) tr(", +%d not sent", ", +%d neodeslané").format(Locale.ROOT, unsent - minuteUnsent) else "")
                     if (!minuteLost) MinerState.say(tr("minute: %.0f H/s, battery %.1f °C, thermal status %d%s", "minuta: %.0f H/s, baterie %.1f °C, tepelný stav %d%s").format(Locale.ROOT,
                         (h - minuteHashes) / ((nanos - minuteTime) / 1e9), temp, thermalNow, if (paused != null) tr(", paused", ", pauza") else "") + shares)
                     minuteHashes = h; minuteTime = nanos; minuteLost = false
-                    minuteAccepted = MinerState.accepted; minuteRefused = MinerState.refused
+                    minuteAccepted = MinerState.accepted; minuteRefused = MinerState.refused; minuteUnsent = unsent
+                }
+                // A difficulty at which every hash, or none in a day, would be a share is said once (review of 0.3.0, N4):
+                // on average a share takes 2^32 times the difficulty hashes.
+                val d = MinerState.difficulty
+                if (inPool && d > 0.0 && d != judged && MinerState.rate > 0.0 && paused == null) {
+                    judged = d
+                    val seconds = 4_294_967_296.0 * d / MinerState.rate
+                    if (seconds < 1.0) MinerState.say(tr("the pool's difficulty %s gives a share every %.2f s at this rate: very many messages to the pool", "obtížnost poolu %s dává při této rychlosti podíl každých %.2f s: velmi mnoho zpráv poolu").format(Locale.ROOT, shownDifficulty(d), seconds))
+                    else if (seconds > 86_400.0) MinerState.say(tr("the pool's difficulty %s gives a share only every %.1f days at this rate: the pool may count no work from this phone", "obtížnost poolu %s dává při této rychlosti podíl jen každých %.1f dne: pool nemusí tomuto telefonu započítat žádnou práci").format(Locale.ROOT, shownDifficulty(d), seconds / 86_400.0))
                 }
                 lastHashes = h
                 lastTime = nanos
@@ -668,6 +790,7 @@ class MinerService : Service() {
                 val idle = synchronized(lock) { current } == null
                 val line = when {
                     pause != null -> tr("paused: $pause", "pauza: $pause")
+                    idle && building > -2 -> tr("preparing memory for the RandomX key of block $building (minutes)", "připravuji paměť pro klíč RandomX bloku $building (minuty)")
                     inPool && idle -> if (stratum == null) tr("waiting for the pool", "čekám na pool") else if (preparedKey == null) tr("preparing", "připravuji") else tr("waiting for work from the pool", "čekám na práci od poolu")
                     idle -> if (keyHeight < 0) tr("preparing", "připravuji") else tr("waiting for work from the node", "čekám na práci od uzlu")
                     inPool -> tr("mining in the pool: %.0f H/s, difficulty %s, threads %d, battery %.1f °C", "těžím v poolu: %.0f H/s, obtížnost %s, počet vláken %d, baterie %.1f °C").format(Locale.ROOT,

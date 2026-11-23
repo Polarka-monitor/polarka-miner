@@ -37,6 +37,42 @@ import java.util.concurrent.atomic.AtomicInteger
 /** The pool said no, or said something that is not stratum. The message is fit for the screen. */
 open class StratumError(message: String) : Exception(message)
 
+/**
+ * How deeply a JSON text nests its brackets and braces, outside its strings. Android's JSON reader calls itself
+ * once for every level and knows no limit, so a line of tens of thousands of brackets would overflow the stack of
+ * the thread that reads it, and Android ends the app for that (review of 0.3.0, H1). A line is therefore measured
+ * before it is read: nothing a pool or a node sends nests deeper than a few levels.
+ */
+object JsonDepth {
+    const val MOST = 16
+
+    /** The deepest level of [text], counting stops once it is past [most]. */
+    fun of(text: String, most: Int = MOST): Int {
+        var depth = 0
+        var deepest = 0
+        var inString = false
+        var escaped = false
+        for (c in text) {
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == '"' -> inString = false
+                }
+                continue
+            }
+            when (c) {
+                '"' -> inString = true
+                '[', '{' -> { depth++; if (depth > deepest) { deepest = depth; if (deepest > most) return deepest } }
+                ']', '}' -> depth--
+            }
+        }
+        return deepest
+    }
+
+    fun fits(text: String, most: Int = MOST): Boolean = of(text, most) <= most
+}
+
 /** Where a pool listens: stratum+tcp://host:port. */
 class StratumUrl(val host: String, val port: Int) {
     override fun toString(): String = SCHEME + (if (host.contains(':')) "[$host]" else host) + ":" + port
@@ -83,9 +119,9 @@ class StratumJob(
     val coinbase2: ByteArray,
     val branch: List<ByteArray>,
     val version: Long,
-    /** Eight hexadecimal digits as the pool sent them. */
+    /** Eight hexadecimal digits, in lower case. */
     val bits: String,
-    /** Eight hexadecimal digits as the pool sent them; a share carries them back unchanged. */
+    /** Eight hexadecimal digits exactly as the pool sent them; a share carries them back unchanged. */
     val time: String,
     val clean: Boolean,
 ) {
@@ -96,28 +132,37 @@ class StratumJob(
         const val MOST_COINBASE = 4096          // bytes of each half of the coinbase
         const val MOST_BRANCH = 32              // a branch of 32 hashes is a block of four billion transactions
 
-        private fun hex(s: Any?, bytes: Int, what: String): ByteArray {
-            val t = s as? String ?: throw StratumError(tr("the pool sent a job without $what", "pool poslal práci bez: $what"))
-            if (t.length != 2 * bytes) throw StratumError(tr("the pool sent a job with a wrong $what", "pool poslal práci se špatnou hodnotou: $what"))
-            return try { Hex.decode(t) } catch (e: IllegalArgumentException) {
-                throw StratumError(tr("the pool sent a job with a wrong $what", "pool poslal práci se špatnou hodnotou: $what"))
-            }
+        /** A part of a job, named in both languages for what the screen says about it. */
+        private class Part(val en: String, val cs: String)
+
+        private val PREVIOUS = Part("previous block", "předchozí blok")
+        private val COINBASE1 = Part("first part of the coinbase", "první část odměnové transakce")
+        private val COINBASE2 = Part("second part of the coinbase", "druhá část odměnové transakce")
+        private val BRANCH = Part("branch", "větev")
+        private val VERSION = Part("version", "verze")
+        private val BITS = Part("bits", "obtížnost bloku")
+        private val TIME = Part("time", "čas")
+
+        private fun without(what: Part) = StratumError(tr("the pool sent a job without its ${what.en}", "pool poslal práci bez položky: ${what.cs}"))
+        private fun wrong(what: Part) = StratumError(tr("the pool sent a job with a wrong ${what.en}", "pool poslal práci se špatnou položkou: ${what.cs}"))
+
+        private fun hex(s: Any?, bytes: Int, what: Part): ByteArray {
+            val t = s as? String ?: throw without(what)
+            if (t.length != 2 * bytes) throw wrong(what)
+            return try { Hex.decode(t) } catch (e: IllegalArgumentException) { throw wrong(what) }
         }
 
-        private fun hexAny(s: Any?, most: Int, what: String): ByteArray {
-            val t = s as? String ?: throw StratumError(tr("the pool sent a job without $what", "pool poslal práci bez: $what"))
-            if (t.length > 2 * most) throw StratumError(tr("the pool sent too long a $what", "pool poslal příliš dlouhou hodnotu: $what"))
-            return try { Hex.decode(t) } catch (e: IllegalArgumentException) {
-                throw StratumError(tr("the pool sent a job with a wrong $what", "pool poslal práci se špatnou hodnotou: $what"))
-            }
+        private fun hexAny(s: Any?, most: Int, what: Part): ByteArray {
+            val t = s as? String ?: throw without(what)
+            if (t.length > 2 * most) throw StratumError(tr("the pool sent too long a ${what.en}", "pool poslal příliš dlouhou položku: ${what.cs}"))
+            return try { Hex.decode(t) } catch (e: IllegalArgumentException) { throw wrong(what) }
         }
 
-        private fun hex8(s: Any?, what: String): String {
+        /** Eight hexadecimal digits, as they came. */
+        private fun hex8(s: Any?, what: Part): String {
             val t = s as? String
-            if (t == null || t.length != 8 || !t.all { Character.digit(it, 16) >= 0 }) {
-                throw StratumError(tr("the pool sent a job with a wrong $what", "pool poslal práci se špatnou hodnotou: $what"))
-            }
-            return t.lowercase(Locale.ROOT)
+            if (t == null || t.length != 8 || !t.all { Character.digit(it, 16) >= 0 }) throw wrong(what)
+            return t
         }
 
         /** [job, previous, coinbase1, coinbase2, branch, version, bits, time, clean] */
@@ -127,15 +172,15 @@ class StratumJob(
             if (id == null || id.isEmpty() || id.length > 64 || !id.all { it in ' '..'~' }) {
                 throw StratumError(tr("the pool sent a job with a wrong name", "pool poslal práci se špatným označením"))
             }
-            val previous = StratumMath.previous(hex(params.opt(1), 32, "previous block"))
-            val coinbase1 = hexAny(params.opt(2), MOST_COINBASE, "coinbase1")
-            val coinbase2 = hexAny(params.opt(3), MOST_COINBASE, "coinbase2")
-            val list = params.opt(4) as? JSONArray ?: throw StratumError(tr("the pool sent a job without a branch", "pool poslal práci bez větve"))
+            val previous = StratumMath.previous(hex(params.opt(1), 32, PREVIOUS))
+            val coinbase1 = hexAny(params.opt(2), MOST_COINBASE, COINBASE1)
+            val coinbase2 = hexAny(params.opt(3), MOST_COINBASE, COINBASE2)
+            val list = params.opt(4) as? JSONArray ?: throw without(BRANCH)
             if (list.length() > MOST_BRANCH) throw StratumError(tr("the pool sent too long a branch", "pool poslal příliš dlouhou větev"))
-            val branch = (0 until list.length()).map { hex(list.opt(it), 32, "branch") }
-            val version = hex8(params.opt(5), "version").toLong(16)
-            val bits = hex8(params.opt(6), "bits")
-            val time = hex8(params.opt(7), "time")
+            val branch = (0 until list.length()).map { hex(list.opt(it), 32, BRANCH) }
+            val version = hex8(params.opt(5), VERSION).toLong(16)
+            val bits = hex8(params.opt(6), BITS).lowercase(Locale.ROOT)
+            val time = hex8(params.opt(7), TIME)
             val clean = params.opt(8) == true
             return StratumJob(id, previous, coinbase1, coinbase2, branch, version, bits, time, clean)
         }
@@ -220,8 +265,66 @@ class PoolWork(
     val connection: Long,
 ) : Mineable
 
-/** A pool that keeps changing the RandomX key: every change costs the phone minutes of building memory. */
+/** A pool that keeps changing the RandomX key, or names one that cannot be: every change costs the phone minutes of building memory. */
 class PoolMisbehaves(message: String) : StratumError(message)
+
+/**
+ * Which RandomX keys a pool may make the phone build its memory for (review of 0.3.0, M1). TrueNorth takes the key
+ * from the block at a multiple of 2048 and changes it every 2048 blocks, about every three days, so:
+ *
+ * - a key's height is a multiple of 2048, and a job's height ([Blocks.seedHeight]) must lead to it;
+ * - one height has one key, and the height never goes back;
+ * - after the first key, the key changes at most once in [CHANGE_MS]; an honest pool needs once in three days.
+ *
+ * What it has accepted it keeps for the whole run, across connections, so that a pool cannot start afresh by
+ * ending the connection. Not thread-safe: the caller holds its lock.
+ */
+class PoolKeys(private val clock: () -> Long = System::currentTimeMillis) {
+    private val byHeight = HashMap<Int, ByteArray>()
+    private var highest = -1
+    private var changedAt = 0L
+
+    /**
+     * Checks a key that the pool named for [height]; throws [PoolMisbehaves] when it cannot be the network's. True
+     * when it is a key not seen before, which the phone will build memory for.
+     */
+    fun named(key: ByteArray, height: Int): Boolean {
+        if (height < 0 || height % Blocks.EPOCH != 0) {
+            throw PoolMisbehaves(tr("the pool named a RandomX key for block $height, and the network takes its keys only from every 2048th block",
+                "pool uvedl klíč RandomX z bloku $height, ale síť bere klíče jen z každého 2048. bloku"))
+        }
+        if (height == 0 && key.any { it.toInt() != 0 }) {
+            // the network's first 2112 blocks are mined with a key of 32 zero bytes, as alone (Work.kt)
+            throw PoolMisbehaves(tr("the pool named a RandomX key for block 0 that is not the network's", "pool uvedl pro blok 0 klíč RandomX, který není klíčem sítě"))
+        }
+        // back to an older key, even one named before, would be one more build: a pool could swing between two
+        if (height < highest) {
+            throw PoolMisbehaves(tr("the pool went back to the RandomX key of an older block ($height)", "pool se vrátil ke klíči RandomX staršího bloku ($height)"))
+        }
+        val known = byHeight[height]
+        if (known != null) {
+            if (known.contentEquals(key)) return false
+            throw PoolMisbehaves(tr("the pool named two different RandomX keys for block $height", "pool uvedl pro blok $height dva různé klíče RandomX"))
+        }
+        val now = clock()
+        if (highest >= 0 && changedAt != 0L && now - changedAt < CHANGE_MS) {
+            throw PoolMisbehaves(tr("the pool changed the RandomX key twice within six hours; the network changes it about every three days",
+                "pool změnil klíč RandomX dvakrát během šesti hodin; síť ho mění zhruba jednou za tři dny"))
+        }
+        if (highest >= 0) changedAt = now
+        byHeight[height] = key.copyOf()
+        highest = height
+        while (byHeight.size > 4) byHeight.remove(byHeight.keys.min())
+        return true
+    }
+
+    /** True when a job for [jobHeight] (-1: not known) is mined with the key of [keyHeight]. */
+    fun fits(jobHeight: Int, keyHeight: Int): Boolean = jobHeight < 0 || Blocks.seedHeight(jobHeight) == keyHeight
+
+    companion object {
+        const val CHANGE_MS = 6 * 3600_000L
+    }
+}
 
 /** What a pool says, as the client reads it. Called on the client's reading thread: quick, no waiting. */
 interface StratumEvents {
@@ -254,7 +357,12 @@ class StratumClient(
         private set
     @Volatile var authorized = false
         private set
+    /** True once the pool has let the address mine on this connection; unlike [authorized], [close] keeps it. */
+    @Volatile var wasAuthorized = false
+        private set
     @Volatile private var closed = false
+    /** The newest job that came before the address was let in; given once it is (review of 0.3.0, L2). */
+    private var held: StratumJob? = null
 
     fun run() {
         val s = Socket()
@@ -262,7 +370,8 @@ class StratumClient(
         if (closed) { s.close(); throw IOException("closed") }
         try {
             s.connect(InetSocketAddress(url.host, url.port), CONNECT_MS)
-            s.soTimeout = READ_MS
+            // until the address is let in, an answer is waited for briefly; then the pool may be quiet for longer
+            s.soTimeout = ANSWER_MS
             s.tcpNoDelay = true
             s.keepAlive = true
             val input = BufferedInputStream(s.getInputStream())
@@ -275,6 +384,9 @@ class StratumClient(
                 throw StratumError(tr("the pool did not let this address mine: ", "pool tuto adresu těžit nenechal: ") + reason(auth.opt("error")))
             }
             authorized = true
+            wasAuthorized = true
+            s.soTimeout = READ_MS
+            held?.let { held = null; events.job(it) }
             while (true) handle(line(input))
         } finally {
             close()
@@ -296,17 +408,24 @@ class StratumClient(
         extranonce2Size = size
     }
 
-    /** Lines until the answer to [id]; what the pool says meanwhile is handled as it comes. */
+    /**
+     * Lines until the answer to [id]; what the pool says meanwhile is handled as it comes. The answer has
+     * [ANSWER_MS] to come, however much else the pool sends meanwhile.
+     */
     private fun answer(input: InputStream, id: Int): JSONObject {
+        val until = System.currentTimeMillis() + ANSWER_MS
         while (true) {
             val said = parse(line(input))
             if (said.has("method") && !said.isNull("method")) dispatch(said)
             else if (said.optInt("id", -1) == id) return said
+            if (System.currentTimeMillis() > until) throw StratumError(tr("the pool did not answer in time", "pool neodpověděl včas"))
         }
     }
 
-    private fun parse(line: String): JSONObject = try { JSONObject(line) } catch (e: Exception) {
-        throw StratumError(tr("the pool sent something that is not stratum", "pool poslal něco, co není stratum"))
+    private fun parse(line: String): JSONObject {
+        val notStratum = StratumError(tr("the pool sent something that is not stratum", "pool poslal něco, co není stratum"))
+        if (!JsonDepth.fits(line)) throw StratumError(tr("the pool sent too deeply nested a line", "pool poslal příliš hluboko vnořený řádek"))
+        return try { JSONObject(line) } catch (e: Exception) { throw notStratum } catch (e: StackOverflowError) { throw notStratum }
     }
 
     private fun handle(line: String) {
@@ -336,7 +455,9 @@ class StratumClient(
             }
             "mining.notify" -> {
                 if (extranonce1.isEmpty()) return          // work before the subscription is answered cannot be used
-                events.job(StratumJob.parse(params))
+                val job = StratumJob.parse(params)
+                // work before the address is let in is kept, not mined: nothing found for it could be sent
+                if (authorized) events.job(job) else held = job
             }
             "client.show_message" -> events.message(plain(params.opt(0)?.toString() ?: ""))
             else -> {}                                      // anything else is not needed to mine
@@ -384,7 +505,7 @@ class StratumClient(
             if (b < 0) throw IOException(tr("the pool closed the connection", "pool ukončil spojení"))
             if (b == '\n'.code) {
                 val s = buf.toString("UTF-8").trim()
-                if (s.isEmpty()) continue
+                if (s.isEmpty()) { buf.reset(); continue }      // blank lines do not add up to one too long
                 return s
             }
             buf.write(b)
@@ -394,6 +515,7 @@ class StratumClient(
 
     companion object {
         const val CONNECT_MS = 15_000
+        const val ANSWER_MS = 30_000            // for the answers to the subscription and to the address
         const val READ_MS = 300_000             // a pool sends new work every minute or so; five quiet minutes end it
         const val MOST_LINE = 64 * 1024
         const val MOST_PENDING = 256
@@ -409,7 +531,11 @@ class StratumClient(
             return plain(text).ifEmpty { "?" }
         }
 
-        /** Text from a pool, for the log: printable characters only, at most 200 of them. */
-        fun plain(s: String): String = s.filter { it >= ' ' && it != '\u007f' && !Character.isISOControl(it) }.take(200)
+        /**
+         * Text from a pool, for the log: printable ASCII only, at most 200 characters, as the node's words are kept
+         * (NodeClient). No line or paragraph separator, no change of the writing direction, nothing invisible
+         * (review of 0.3.0, L4).
+         */
+        fun plain(s: String): String = s.filter { it in ' '..'~' }.take(200)
     }
 }

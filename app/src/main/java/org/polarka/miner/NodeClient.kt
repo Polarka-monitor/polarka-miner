@@ -65,7 +65,7 @@ class NodeClient(url: String, user: String, password: String) {
             val text = text(c, code)
             if (code == 429) throw NodeError(tr("the server asks for fewer requests (429)", "server žádá méně dotazů (429)"))
             if (code == 404) throw NodeError(tr("nothing hands out work at this address (404): check the server's address, or the server has no mining routes", "na této adrese nikdo práci nerozdává (404): zkontroluj adresu serveru, nebo server těžební trasy nemá"))
-            val ans = try { JSONObject(text) } catch (e: Exception) { null }
+            val ans = objectOf(text)
             if (code !in 200..299) {
                 // the server's own words, for the owner's eyes: short and without anything but plain letters
                 val why = (ans?.optString("message") ?: "").filter { it in ' '..'~' }.take(160)
@@ -76,6 +76,15 @@ class NodeClient(url: String, user: String, password: String) {
             if (interruptible) waiting = null
             c.disconnect()
         }
+    }
+
+    /**
+     * A JSON object, or null when the text is none, nests too deeply or cannot be read. The depth is measured first:
+     * Android's JSON reader has no limit of its own, and a deep enough answer would end the app (review of 0.3.0, H1).
+     */
+    private fun objectOf(text: String): JSONObject? {
+        if (!JsonDepth.fits(text)) return null
+        return try { JSONObject(text) } catch (e: Exception) { null } catch (e: StackOverflowError) { null }
     }
 
     private fun call(method: String, params: JSONArray, readTimeoutMs: Int, interruptible: Boolean): Any? {
@@ -95,7 +104,7 @@ class NodeClient(url: String, user: String, password: String) {
             if (code == 401) throw NodeError(tr("the node refused the name or the password (401)", "uzel odmítl jméno nebo heslo (401)"))
             if (code == 403) throw NodeError(tr("the node does not allow this user that call ($method, 403)", "uzel toto volání uživateli nedovoluje ($method, 403)"))
             val text = text(c, code)
-            val ans = try { JSONObject(text) } catch (e: Exception) { throw NodeError(tr("an answer from the node that was not expected (HTTP $code)", "uzel odpověděl nečekaně (HTTP $code)")) }
+            val ans = objectOf(text) ?: throw NodeError(tr("an answer from the node that was not expected (HTTP $code)", "uzel odpověděl nečekaně (HTTP $code)"))
             if (!ans.isNull("error")) {
                 val err = ans.optJSONObject("error")
                 throw NodeError(tr("node: ", "uzel: ") + (err?.optString("message") ?: ans.get("error").toString()).take(200))

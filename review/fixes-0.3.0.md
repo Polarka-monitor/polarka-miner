@@ -1,0 +1,29 @@
+# What was done about the review of 0.3.0
+
+The review (`report-0.3.0.md`) read commit 33f482d. Everything below is in the commit after it, still 0.3.0, before anything was released. Nobody independent has looked at these fixes yet. "Checked" names what ran; "read" means that nothing ran it.
+
+| ID | What was done | Checked |
+|---|---|---|
+| H1 | Every line from a pool and every answer of a node or a wallet server is measured before it is parsed: more than 16 levels of brackets and braces outside strings is refused (`JsonDepth` in `Stratum.kt`, used in `StratumClient.parse` and `NodeClient.objectOf`). A `StackOverflowError` from the parser is turned into the client's own error as well. `stratumLoop` and `poolWorkLoop` catch any `Throwable`, so a failure ends a connection or a piece of work, never the app. | `stratum-jvm --unit`: a fake pool sends 60,000 brackets after the subscription; the client ends the connection with a `StratumError` ("too deeply nested"). Android's own parser did not run. |
+| M1 | No memory is built while mining is paused: the newest work waits and the build follows the pause. The memory is built with the threads the owner set, not with every core. The keys a pool may name are checked by `PoolKeys`: a key only for a block at a multiple of 2048 (32 zero bytes for block 0), one key per block, never back to an older block, and after the first key at most one change in six hours. A job is used only when its block leads to the key's block (`Blocks.seedHeight`). A pool that breaks these rules is left for an hour, not ten minutes. | `--unit`: each rule, with a clock of its own. `stratum_check.py`: the pool's real key change (block 2048 to block 4096) still goes through. The pause and the threads were read only. |
+| M2 | A pool's worker name and password are stored apart from a node's user and password (`poolUser`, `poolPassword` beside `user`, `password`). The two fields show the pair that belongs to the address typed above, and switch when the address changes from a pool to a node or back. The screen and the README say that stratum+tcp is not encrypted. | Read only: the screen has not run. |
+| L1 | After a pause the job in hand is given to the workers as new work, with a new extranonce2 and a new number, so they do not search again what they searched before. A share (job, nonce) is sent once. | Read only. |
+| L2 | Work that comes before the pool lets the address in is kept and given once it does. The answers to the subscription and to the address have 30 seconds, however much else the pool sends meanwhile. A share that could not be sent is counted, said at most once a minute and shown in the minute's line. | `--unit`: a fake pool sends a job before its answer to the address; the job is given after it. The 30 seconds were read only. |
+| L3 | The difficulty and the key are those of the connection a job came on. A new connection mines only after it has named both. | `stratum_check.py` (a connection that ends and a new one); the order "job before difficulty" was read only. |
+| L4 | Text from a pool keeps printable ASCII only, as the node's words already did. Pool messages: at most one every five seconds, and the same one not again within a minute. | `--unit`: U+2028, U+2029, U+202E, U+200B and a control character are gone. |
+| L5 | Blocks and shares are counted from zero at the start of every run. | Read only. |
+| L6 | Said plainly in the README and on the screen: on the way to a pool, anyone can read and change what is sent, even the address that gets paid; mine in a pool on a network you trust. stratum over TLS is not offered (no pool for TrueNorth offers it that I know of). | Read. |
+| L7 | `stratum-jvm --unit` adds the negative cases asked for (deep nesting, text that is not plain, work before the address is let in, blank lines, the key rules). The pool code of `MinerService` still does not run on a computer; the README says so. The harness still uses its own JSON library; the depth is checked before any parser, so the parser's limit no longer decides. | `--unit`, 18 checks. |
+| N1 | `wasAuthorized` is kept when the connection is closed; the longer wait applies only to a pool that never let the address in. | Read. |
+| N2 | A blank line no longer adds to the length of the next one. | `--unit`: 70,000 blank lines, then a message. |
+| N3 | A clean job that a newer one replaced before the workers got it still clears the older jobs. | Read. |
+| N4 | A difficulty that gives a share in under a second, or not even one a day, at the rate measured is said once in the log. | Read. |
+| N5 | Not changed. Writes to the pool have no timeout of their own; they are bounded by the 256 shares that may wait for an answer and by the read timeout that ends a quiet connection. | |
+| N6 | The README names what a pool must do (the key with its block, a non-empty extranonce1, coinbase halves of at most 4 KiB, the difficulty as a number) and that one pool has been tried. The time goes back exactly as the pool sent it. | `stratum_check.py`. |
+| N7 | At Stop, shares already found are sent on the connection that is still open; it is closed after them. | Read. |
+| N8 | While memory is built the status says so, with the key's block. A failed preparation no longer closes the connection, so its message stays on the screen. | Read. |
+| N9 | Three preparations that fail one after another end the run, alone or in a pool. | Read. |
+| N10 | Not changed: jobs that come faster than the workers are given them are not limited. A pool would have to send dozens a second. | |
+| N11 | Czech messages name the parts of a job in Czech. | Read. |
+| N12 | The first point of "What it does" covers both ways. The pool's payout says what its code holds (PPS, 5 %, 1 NORTH) and that how often it pays is set where it runs. | Read. |
+| N13 | Alone, the workers stop before the node is asked for a new key. | Read. |
